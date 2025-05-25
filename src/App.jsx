@@ -7,6 +7,8 @@ const App = () => {
 
   return (
     <div>
+      <header>🏋️‍♂️ TrackerBro</header>
+
       <nav>
         <button
           className={tab === 'chat' ? 'active' : ''}

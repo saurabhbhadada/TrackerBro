@@ -2,6 +2,10 @@ import { useEffect, useState } from 'react';
 import { queryQwen3 } from '../utils/api';
 import { getDB } from '../utils/db';
 import { Chart } from 'chart.js/auto';
+import 'chartjs-adapter-date-fns';
+
+Chart.defaults.color       = '#eee';
+Chart.defaults.borderColor = '#333';
 
 /* ------------------------------------------------------------- */
 /*  Helpers – robust chart builder                               */
@@ -17,72 +21,55 @@ const stripFence = (s) => {
   return t.trim();
 };
 
-/** Destroy old chart, build new, store ref. */
 const mountChart = (maker, setRef) => {
-  setRef((prev) => { if (prev) prev.destroy(); return prev; });
+  setRef((old) => { if (old) old.destroy(); return null; });
   const canvas = document.getElementById('myChart');
-  const chart  = maker(canvas);          // may throw
+  const chart  = maker(canvas);
   setRef(chart);
   return chart;
 };
 
-/**
- * Try three strategies in order:
- *   1) JSON-parse as plain Chart.js config object.
- *   2) Execute full JS **without ctx param** if the code declares ctx itself.
- *   3) Execute full JS **with ctx param** when it doesn’t.
- */
 const buildChart = (rawJS, setRef) =>
-  mountChart((canvas) => {
+  mountChart((__el) => {
     const code = stripFence(rawJS);
 
-    /* 1️⃣ CONFIG OBJECT ------------------------------------- */
-    if (code.startsWith('{') || code.startsWith('[')) {
-      const cfg = JSON.parse(code);             // strict — will throw if not JSON
-      return new Chart(canvas, cfg);
+    /* 1️⃣ plain config object */
+    if (/^[\[{]/.test(code)) {
+      return new Chart(__el, JSON.parse(code));
     }
 
-    /* Check if the code defines ctx itself */
-    const declaresCtx = /\b(?:const|let|var)\s+ctx\b/.test(code);
-
-    /* 2️⃣/3️⃣ FULL JS --------------------------------------- */
-    const fn = declaresCtx
-      ? new Function('Chart', 'canvas', code)
-      : new Function('Chart', 'canvas', 'ctx', code);
-
-    const maybe = declaresCtx
-      ? fn(Chart, canvas)
-      : fn(Chart, canvas, canvas.getContext('2d'));
-
-    /* Fallback if author forgot to return */
-    return maybe instanceof Chart ? maybe : Chart.getChart(canvas);
+    /* 2️⃣ full JS sandbox */
+    const sandboxDoc = { getElementById: () => __el };
+    const fn = new Function(
+      'Chart', '__el', '__ctx', 'document',
+      `${code}\nreturn typeof chart === 'object' ? chart : undefined;`,
+    );
+    const maybe = fn(Chart, __el, __el.getContext('2d'), sandboxDoc);
+    return maybe instanceof Chart ? maybe : Chart.getChart(__el);
   }, setRef);
 
 /* ------------------------------------------------------------- */
 /*  Component                                                    */
 /* ------------------------------------------------------------- */
 const Analytics = () => {
-  const [query, setQuery]           = useState('');
-  const [feedback, setFeedback]     = useState(null);
-  const [habits, setHabits]         = useState([]);
-  const [selected, setSelected]     = useState(null);
-  const [chartRef, setChartRef]     = useState(null);
+  const [query, setQuery]       = useState('');
+  const [feedback, setFeedback] = useState(null);
+  const [habits, setHabits]     = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [chartRef, setChartRef] = useState(null);
 
-  /* ---------- Build / rebuild chart via LLM (with one retry) ---------- */
   const makeChart = async (prompt) => {
     const raw = await queryQwen3(prompt);
     try { return buildChart(raw, setChartRef); }
     catch (e1) {
-      console.warn('Chart build failed once, retrying…', e1);
+      console.warn('Chart failed, retrying…', e1);
       const raw2 = await queryQwen3(
-        'Your previous answer was invalid JS. '
-      + 'Return ONLY valid JavaScript (no markdown/HTML).  ' + prompt,
+        'Previous answer was invalid JS. Return ONLY valid JavaScript.  ' + prompt,
       );
-      return buildChart(raw2, setChartRef);      // bubble on second failure
+      return buildChart(raw2, setChartRef);
     }
   };
 
-  /* ---------- free-form query ---------- */
   const runFreeQuery = async () => {
     if (!query.trim()) return;
     setFeedback(null); setSelected(null);
@@ -93,15 +80,13 @@ const Analytics = () => {
     await makeChart(`
 Data: ${JSON.stringify(data)}
 User analytics request: "${query}".
-Respond with EITHER:
- • a Chart.js config object (starts with "{"),
- • or full JavaScript that uses the provided variables
-   (Chart, canvas, ctx) and returns the Chart instance.
+Return EITHER:
+  • a Chart.js config object, OR
+  • full JavaScript that builds and returns a Chart instance.
 No HTML, no markdown.
     `).catch(() => alert('Failed to build chart.'));
   };
 
-  /* ---------- habit list + card helper ---------- */
   const refreshHabits = async () => {
     const db   = await getDB();
     const data = await db.getAll('logs');
@@ -119,18 +104,16 @@ No HTML, no markdown.
     setHabits(list);
   };
 
-  /* ---------- habit card click ---------- */
   const showHabit = async (h) => {
     setSelected(h); setFeedback(null); setQuery('');
 
     await makeChart(`
 Logs for habit "${h.name}": ${JSON.stringify(h.entries)}
 Create an insightful Chart.js visual.
-Use the provided "canvas" or "ctx". JS only, no markdown.
+Use the provided canvas. JS only, no markdown.
     `).catch(()=>alert('Failed to build habit chart.'));
   };
 
-  /* ---------- feedback ---------- */
   const vote = async (ok) => {
     setFeedback(ok);
     if (ok) return;
@@ -140,50 +123,45 @@ Use the provided "canvas" or "ctx". JS only, no markdown.
     ); } catch {/* ignore */}
   };
 
-  /* ---------- initial load ---------- */
   useEffect(() => { refreshHabits(); }, []);
 
-  /* ---------- render ---------- */
   return (
-    <div style={{ padding:'1rem' }}>
-      <h2>🧠 Ask AI for Analytics</h2>
+    <div style={{ padding: '1rem' }}>
+      <h2>🧠 Ask TrackerBro for Analytics</h2>
       <input
-        style={{ width:'100%',padding:'.5rem' }}
-        placeholder='e.g., "show water intake trend"'
+        style={{ width: '100%', padding: '.5rem' }}
+        placeholder='e.g., "show water-intake trend"'
         value={query}
-        onChange={e=>setQuery(e.target.value)}
+        onChange={e => setQuery(e.target.value)}
       />
       <button onClick={runFreeQuery}>Generate Chart</button>
 
-      {chartRef && feedback===null && (
+      {chartRef && feedback === null && (
         <>
           <p>Was that helpful?</p>
-          <button onClick={()=>vote(true)}>👍 Yes</button>
-          <button onClick={()=>vote(false)}>👎 No</button>
+          <button onClick={() => vote(true)}>👍 Yes</button>
+          <button onClick={() => vote(false)}>👎 No</button>
         </>
       )}
 
-      <canvas id="myChart" style={{ maxWidth:'100%',marginTop:'1rem' }} />
+      <canvas id="myChart" />
 
-      <hr style={{ margin:'2rem 0' }} />
+      <hr style={{ margin: '2rem 0' }} />
 
       <h2>📋 Habit Cards</h2>
       <button onClick={refreshHabits}>🔄 Refresh</button>
 
-      <div style={{ display:'flex',flexWrap:'wrap',gap:'1rem',marginTop:'1rem' }}>
-        {habits.map(h=>(
-          <div key={h.name}
-            onClick={()=>showHabit(h)}
-            style={{
-              border:'1px solid #333',borderRadius:10,padding:'1rem',width:180,
-              cursor:'pointer',
-              background:selected?.name===h.name?'#00ffc633':'#1a1a1a',
-              color:'#eee',
-            }}>
+      <div className="habit-cards">
+        {habits.map(h => (
+          <div
+            key={h.name}
+            className={`habit-card ${selected?.name === h.name ? 'active' : ''}`}
+            onClick={() => showHabit(h)}
+          >
             <strong>{h.name}</strong>
             <p>{h.count} logs</p>
             <p>Last: {h.last ? new Date(h.last).toLocaleDateString() : '-'}</p>
-            {h.total>0 && <p>Total: {h.total}</p>}
+            {h.total > 0 && <p>Total: {h.total}</p>}
           </div>
         ))}
       </div>
