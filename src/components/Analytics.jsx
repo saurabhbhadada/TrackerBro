@@ -8,9 +8,10 @@ Chart.defaults.color       = '#eee';
 Chart.defaults.borderColor = '#333';
 
 /* ------------------------------------------------------------- */
-/*  Helpers – robust chart builder                               */
+/*  Helpers                                                      */
 /* ------------------------------------------------------------- */
 
+// drop ``` fences and leading / trailing whitespace
 const stripFence = (s) => {
   let t = s.trim();
   if (t.startsWith('```')) {
@@ -21,32 +22,34 @@ const stripFence = (s) => {
   return t.trim();
 };
 
-const mountChart = (maker, setRef) => {
-  setRef((old) => { if (old) old.destroy(); return null; });
-  const canvas = document.getElementById('myChart');
-  const chart  = maker(canvas);
-  setRef(chart);
-  return chart;
+/** Destroy whatever Chart.js instance is bound to this canvas. */
+const nukeOldChart = (canvas) => {
+  const old = Chart.getChart(canvas);
+  if (old) old.destroy();
 };
 
-const buildChart = (rawJS, setRef) =>
-  mountChart((__el) => {
-    const code = stripFence(rawJS);
+/** Try to turn a string into a plain JS object (strict JSON first). */
+const toObject = (code) => {
+  try {
+    return JSON.parse(code);               // valid JSON – fast path
+  } catch {
+    /* Fall back to tolerant object-literal parsing. */
+    // eslint-disable-next-line no-new-func
+    return Function('"use strict";return (' + code + ')')();
+  }
+};
 
-    /* 1️⃣ plain config object */
-    if (/^[\[{]/.test(code)) {
-      return new Chart(__el, JSON.parse(code));
-    }
+/** Single-responsibility builder: returns a *new* Chart or throws. */
+const createChart = (canvas, raw) => {
+  const clean = stripFence(raw);
 
-    /* 2️⃣ full JS sandbox */
-    const sandboxDoc = { getElementById: () => __el };
-    const fn = new Function(
-      'Chart', '__el', '__ctx', 'document',
-      `${code}\nreturn typeof chart === 'object' ? chart : undefined;`,
-    );
-    const maybe = fn(Chart, __el, __el.getContext('2d'), sandboxDoc);
-    return maybe instanceof Chart ? maybe : Chart.getChart(__el);
-  }, setRef);
+  if (!/^[\[{]/.test(clean)) {
+    throw new Error('Not a config object');        // triggers retry
+  }
+
+  const cfg = toObject(clean);
+  return new Chart(canvas, cfg);
+};
 
 /* ------------------------------------------------------------- */
 /*  Component                                                    */
@@ -58,18 +61,30 @@ const Analytics = () => {
   const [selected, setSelected] = useState(null);
   const [chartRef, setChartRef] = useState(null);
 
+  /* ---------- Build / rebuild chart (with one retry) ---------- */
   const makeChart = async (prompt) => {
+    const canvas = document.getElementById('myChart');
+    nukeOldChart(canvas);
+
     const raw = await queryQwen3(prompt);
-    try { return buildChart(raw, setChartRef); }
-    catch (e1) {
+    try {
+      const ch = createChart(canvas, raw);
+      setChartRef(ch);
+      return ch;
+    } catch (e1) {
       console.warn('Chart failed, retrying…', e1);
+
+      nukeOldChart(canvas);               // ensure blank slate
       const raw2 = await queryQwen3(
-        'Previous answer was invalid JS. Return ONLY valid JavaScript.  ' + prompt,
+        'Return ONLY a valid Chart.js **JSON object** (no JS code).  ' + prompt,
       );
-      return buildChart(raw2, setChartRef);
+      const ch2 = createChart(canvas, raw2);
+      setChartRef(ch2);
+      return ch2;
     }
   };
 
+  /* ---------- free-form query ---------- */
   const runFreeQuery = async () => {
     if (!query.trim()) return;
     setFeedback(null); setSelected(null);
@@ -79,14 +94,13 @@ const Analytics = () => {
 
     await makeChart(`
 Data: ${JSON.stringify(data)}
-User analytics request: "${query}".
-Return EITHER:
-  • a Chart.js config object, OR
-  • full JavaScript that builds and returns a Chart instance.
-No HTML, no markdown.
+User request: "${query}".
+Produce a concise Chart.js line, bar or scatter chart *only* as a JSON
+config object. No markdown, comments or executable JS.
     `).catch(() => alert('Failed to build chart.'));
   };
 
+  /* ---------- habits ---------- */
   const refreshHabits = async () => {
     const db   = await getDB();
     const data = await db.getAll('logs');
@@ -109,22 +123,23 @@ No HTML, no markdown.
 
     await makeChart(`
 Logs for habit "${h.name}": ${JSON.stringify(h.entries)}
-Create an insightful Chart.js visual.
-Use the provided canvas. JS only, no markdown.
+Return a Chart.js config object visualising the data vs. date.
     `).catch(()=>alert('Failed to build habit chart.'));
   };
 
+  /* ---------- feedback ---------- */
   const vote = async (ok) => {
     setFeedback(ok);
     if (ok) return;
     const title = selected ? selected.name : query;
     try { await makeChart(
-      `User disliked chart for "${title}". Improve it. Same constraints.`,
+      `User disliked chart "${title}". Improve & resend JSON config.`,
     ); } catch {/* ignore */}
   };
 
   useEffect(() => { refreshHabits(); }, []);
 
+  /* ---------- render ---------- */
   return (
     <div style={{ padding: '1rem' }}>
       <h2>🧠 Ask TrackerBro for Analytics</h2>
